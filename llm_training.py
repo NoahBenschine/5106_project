@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+import time
 import numpy as np
 import torch
 import torch.nn as nn
@@ -11,7 +12,6 @@ from pydantic import BaseModel, Field
 # ----------------------------------------------------
 # 0. Import Local Overcooked AI Package
 # ----------------------------------------------------
-# Ensures the local overcooked_ai directory in the same folder is prioritized
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "overcooked_ai")))
 
 from overcooked_ai_py.mdp.overcooked_mdp import OvercookedGridworld
@@ -21,6 +21,7 @@ from overcooked_ai_py.mdp.actions import Action
 # Gemini SDK Setup
 from google import genai
 from google.genai import types
+from google.genai.errors import APIError
 
 
 # ----------------------------------------------------
@@ -61,129 +62,369 @@ class CounterfactualRewardPatch(BaseModel):
 class CounterfactualFeedback(BaseModel):
     patches: list[CounterfactualRewardPatch]
 
-def query_gemini_counterfactuals(client, trajectory_window):
-    """Sends the recent K steps to Gemini to get counterfactual reward adjustments."""
-    prompt = f"""
-    You are an expert multi-agent RL credit assignment evaluator for Overcooked.
-    Analyze this sequence of trajectory steps where two agents interact:
-    
-    {json.dumps(trajectory_window, indent=2)}
-    
-    For each agent in the window, evaluate counterfactual actions:
-    Did an agent perform a helpful intermediate action (e.g., placing soup ingredient, passing plate)
-    that wasn't immediately rewarded by the environment? Or did they block the other agent?
-    
-    Return reward adjustments (between -1.0 and 1.0) for relevant steps.
-    """
-    
+
+def write_log(filepath, data):
+    """Appends a single JSON entry as a new line in a file."""
+    with open(filepath, "a", encoding="utf-8") as f:
+        f.write(json.dumps(data) + "\n")
+
+
+def query_gemini_counterfactuals(client, trajectory_window, model_io_log_path, episode, global_step):
+    """Sends recent K steps to Gemini for counterfactual reward adjustments and logs I/O."""
+    compact_trajectory = json.dumps(trajectory_window, separators=(",", ":"))
+
+    prompt = f"""You are an expert multi-agent RL credit assignment evaluator for Overcooked.
+Analyze this sequence of trajectory steps where two agents interact:
+
+{compact_trajectory}
+
+For each agent in the window, evaluate counterfactual actions:
+Did an agent perform a helpful intermediate action (e.g., placing soup ingredient, passing plate)
+that wasn't immediately rewarded by the environment? Or did they block the other agent?
+
+Return reward adjustments (between -1.0 and 1.0) for relevant steps."""
+
+    start_time = time.time()
     try:
         response = client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-3.5-flash-lite",  # Updated to Flash Lite for higher daily limits (500 RPD)
             contents=prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
                 response_schema=CounterfactualFeedback,
-                temperature=0.2
-            )
+                temperature=0.2,
+            ),
         )
+
+        latency = time.time() - start_time
+        usage = response.usage_metadata
+        token_info = {
+            "prompt_tokens": usage.prompt_token_count if usage else 0,
+            "candidates_tokens": usage.candidates_token_count if usage else 0,
+            "total_tokens": usage.total_token_count if usage else 0,
+        }
+
+        # Log LLM I/O detail
+        write_log(model_io_log_path, {
+            "timestamp": time.time(),
+            "episode": episode,
+            "global_step": global_step,
+            "status": "success",
+            "latency_sec": latency,
+            "prompt": prompt,
+            "raw_response": response.text,
+            "tokens": token_info
+        })
+
+        if not response.text:
+            print("[Gemini API Warning] Empty response returned.")
+            return []
+
         feedback = CounterfactualFeedback.model_validate_json(response.text)
         return feedback.patches
-    except Exception as e:
-        print(f"[Gemini API Warning] Counterfactual call failed: {e}")
+
+    except APIError as e:
+        print(f"[Gemini API Rate Limit / Error] {e}")
+        write_log(model_io_log_path, {
+            "timestamp": time.time(),
+            "episode": episode,
+            "global_step": global_step,
+            "status": "rate_limited_or_api_error",
+            "error_message": str(e),
+            "prompt": prompt
+        })
         return []
+    except Exception as e:
+        print(f"[Gemini API Exception] {e}")
+        write_log(model_io_log_path, {
+            "timestamp": time.time(),
+            "episode": episode,
+            "global_step": global_step,
+            "status": "exception",
+            "error_message": str(e),
+            "prompt": prompt
+        })
+        return []
+
+
+def extract_rich_step_info(env, joint_action, step_count, reward):
+    state = env.state
+    mdp = env.mdp
+    
+    action_names = [str(a) for a in joint_action]
+    
+    agent_data = {}
+    for i, player in enumerate(state.players):
+        held_obj = player.held_object.name if player.has_object() else "empty"
+        agent_data[f"agent_{i}"] = {
+            "pos": list(player.position),
+            "orientation": list(player.orientation),
+            "holding": held_obj,
+            "action": action_names[i]
+        }
+    
+    pot_states = []
+    pot_locations = mdp.get_pot_locations()
+    
+    for pot_pos in pot_locations:
+        if state.has_object(pot_pos):
+            obj = state.get_object(pot_pos)
+            pot_states.append({
+                "pos": list(pot_pos),
+                "is_empty": False,
+                "soup_type": obj.name,
+                "num_ingredients": len(obj.ingredients),
+                "is_cooking": obj.is_cooking if hasattr(obj, "is_cooking") else False,
+                "is_ready": obj.is_ready if hasattr(obj, "is_ready") else False
+            })
+        else:
+            pot_states.append({
+                "pos": list(pot_pos),
+                "is_empty": True,
+                "num_ingredients": 0
+            })
+
+    return {
+        "step": step_count,
+        "env_reward": float(reward),
+        "agents": agent_data,
+        "pots": pot_states
+    }
+
+
+# Environment / Execution Config
+DEBUG_MODE = False
+
+MIN_GEMINI_INTERVAL = 6.0
 
 
 # ----------------------------------------------------
 # 3. Main Training Loop
 # ----------------------------------------------------
-def train_overcooked_marl(layout_name="cramped_room", total_episodes=200, k_steps=20):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def train_overcooked_marl(
+    layout_name="cramped_room",
+    total_episodes=200,
+    k_steps=400,
+    dry_run=True,
+    verbose_trajectory=True,
+    max_episode_seconds=45.0,
+    log_dir="logs",
+    checkpoint_dir="checkpoints",
+    horizon=400,
+    gamma=0.99,            # Discount factor for return computation
+    entropy_coef=0.01      # Encourages exploration
+):
+    os.makedirs(log_dir, exist_ok=True)
+    os.makedirs(checkpoint_dir, exist_ok=True)
     
-    # Initialize Gemini Client (requires GEMINI_API_KEY env variable)
-    gemini_client = genai.Client()
+    trajectory_log_path = os.path.join(log_dir, "trajectory_log.jsonl")
+    model_io_log_path = os.path.join(log_dir, "model_io_log.jsonl")
+    performance_log_path = os.path.join(log_dir, "performance_log.jsonl")
 
-    # Build Overcooked MDP and Environment
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    gemini_client = genai.Client() if not dry_run else None
+
+    MAX_STEPS_PER_EPISODE = 20 if DEBUG_MODE else horizon
     mdp = OvercookedGridworld.from_layout_name(layout_name)
-    env = OvercookedEnv.from_mdp(mdp, horizon=400)
+    env = OvercookedEnv.from_mdp(mdp, horizon=horizon)
     
     num_agents = 2
-    action_dim = len(Action.ALL_ACTIONS) # 6 actions: N, S, E, W, Stay, Interact
+    action_dim = len(Action.ALL_ACTIONS)
     
-    # Reset environment to infer state shape
     env.reset()
-    sample_obs = env.mdp.get_lossless_encoding_dict(env.state)
+    sample_obs = env.lossless_state_encoding_mdp(env.state)
     obs_shape = sample_obs[0].shape
-    obs_dim = int(np.prod(obs_shape)) # Flatten 3D spatial grid tensor
+    obs_dim = int(np.prod(obs_shape))
     
-    # Single network for both agents (Parameter Sharing)
     model = ActorCritic(obs_dim, action_dim).to(device)
     optimizer = optim.Adam(model.parameters(), lr=3e-4)
 
+    # Resume weights from checkpoint if available
+    best_model_path = os.path.join(checkpoint_dir, "best_model.pt")
+    if os.path.exists(best_model_path):
+        model.load_state_dict(torch.load(best_model_path, map_location=device))
+        print(f"--> Resumed training from checkpoint: {best_model_path}")
+
+    max_steps_per_episode = MAX_STEPS_PER_EPISODE
+    last_gemini_call_time = 0
+    global_step = 0
+    best_reward = -float("inf")
+
     for episode in range(total_episodes):
         env.reset()
-        episode_reward = 0
-        trajectory_log = []
+        episode_env_reward = 0.0
+        episode_total_reward = 0.0
         step_count = 0
+        episode_start_time = time.time()
         done = False
+
+        # Rollout buffers
+        obs_buffer = []          # List of tensors shape [2, obs_dim]
+        actions_buffer = []      # List of tensors shape [2]
+        rewards_buffer = []      # List of lists [agent_0_rew, agent_1_rew]
+        step_indices_buffer = [] # Step numbers
+        trajectory_log = []
+
+        print(f"Episode {episode + 1}")
 
         while not done:
             step_count += 1
-            
-            # Extract state tensors for both agents
-            lossless_obs = env.mdp.get_lossless_encoding_dict(env.state)
+            global_step += 1
+
+          
+
+            if time.time() - episode_start_time > max_episode_seconds:
+                print(f"[Timeout] Episode {episode + 1} exceeded {max_episode_seconds}s limit.")
+                break
+
+            lossless_obs = env.lossless_state_encoding_mdp(env.state)
             obs_array = np.array([lossless_obs[i].flatten() for i in range(num_agents)])
             obs_tensor = torch.tensor(obs_array, dtype=torch.float32).to(device)
 
-            # Get Actions from Model
             with torch.no_grad():
-                actions, log_probs, _, values = model.get_action_and_value(obs_tensor)
+                actions, _, _, _ = model.get_action_and_value(obs_tensor)
 
-            # Format actions for Overcooked (Index to Action Object)
             joint_action = tuple(Action.INDEX_TO_ACTION[a.item()] for a in actions)
+            next_state, sparse_reward, done, info = env.step(joint_action)
+            episode_env_reward += sparse_reward
 
-            # Step Environment
-            next_state, reward, done, info = env.step(joint_action)
-            episode_reward += reward
+            shaped_rewards = info.get("shaped_r_by_agent", [0.0, 0.0])
+            step_base_rewards = [sparse_reward + shaped_rewards[0], sparse_reward + shaped_rewards[1]]
 
-            # Per-agent reward tracking
-            rewards_list = [float(reward)] * num_agents 
+            obs_buffer.append(obs_tensor)
+            actions_buffer.append(actions)
+            rewards_buffer.append(step_base_rewards)
+            step_indices_buffer.append(step_count)
 
-            # Trajectory logging for Gemini
-            step_record = {
-                "step": step_count,
-                "agent_actions": [Action.ACTION_TO_INDEX[a] for a in joint_action],
-                "env_reward": float(reward)
-            }
+            step_record = extract_rich_step_info(env, joint_action, step_count, sparse_reward)
             trajectory_log.append(step_record)
 
-            # --------------------------------------------------
-            # Gemini Counterfactual Patching (Every K Steps)
-            # --------------------------------------------------
-            if step_count % k_steps == 0 and len(trajectory_log) >= k_steps:
-                recent_window = trajectory_log[-k_steps:]
-                patches = query_gemini_counterfactuals(gemini_client, recent_window)
-                
-                # Apply patches to rewards_list for credit assignment
-                for patch in patches:
-                    if 0 <= patch.agent_idx < num_agents:
-                        rewards_list[patch.agent_idx] += patch.reward_bonus
+            write_log(trajectory_log_path, {
+                "episode": episode + 1,
+                "global_step": global_step,
+                "record": step_record
+            })
 
-            # --------------------------------------------------
-            # Policy Optimization Step
-            # --------------------------------------------------
-            reward_tensor = torch.tensor(rewards_list, dtype=torch.float32).to(device)
-            advantage = reward_tensor - values.squeeze(-1)
+            # --- Process Batch & Update Policy Every K Steps (or Episode End) ---
+            if step_count % k_steps == 0 or done or step_count >= max_steps_per_episode:
+                recent_window = trajectory_log[-len(obs_buffer):]
 
-            actor_loss = -(log_probs * advantage.detach()).mean()
-            critic_loss = advantage.pow(2).mean()
-            loss = actor_loss + 0.5 * critic_loss
+                if verbose_trajectory:
+                    print(f"\n[Trajectory Log - Ep {episode + 1} | Steps {step_indices_buffer[0]}-{step_indices_buffer[-1]}]")
+                    print(json.dumps(recent_window, indent=2))
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+                # 1. Query Gemini for counterfactual reward adjustments
+                if not dry_run and gemini_client:
+                    current_time = time.time()
+                    time_since_last_call = current_time - last_gemini_call_time
 
+                    if time_since_last_call < MIN_GEMINI_INTERVAL:
+                        time.sleep(MIN_GEMINI_INTERVAL - time_since_last_call)
+
+                    patches = query_gemini_counterfactuals(
+                        gemini_client, recent_window, model_io_log_path, episode + 1, global_step
+                    )
+                    last_gemini_call_time = time.time()
+
+                    # Apply LLM patches to historical buffer steps
+                    window_start_step = step_indices_buffer[0]
+                    for patch in patches:
+                        buffer_idx = patch.step - window_start_step
+                        if 0 <= buffer_idx < len(rewards_buffer):
+                            if 0 <= patch.agent_idx < num_agents:
+                                rewards_buffer[buffer_idx][patch.agent_idx] += patch.reward_bonus
+
+                # 2. Vectorize buffers into single batched tensors
+                # Shapes: batch_obs -> [K, 2, obs_dim], batch_actions -> [K, 2], batch_rewards -> [K, 2]
+                batch_obs = torch.stack(obs_buffer).to(device)
+                batch_actions = torch.stack(actions_buffer).to(device)
+                batch_rewards = torch.tensor(rewards_buffer, dtype=torch.float32, device=device)
+
+                batch_len = len(obs_buffer)
+
+                # 3. Compute discounted return targets (R_t) backward across the buffer
+                batch_returns = torch.zeros_like(batch_rewards)
+                running_return = torch.zeros(num_agents, device=device)
+
+                # Bootstrapping: If not done, estimate future value using critic on the next observation
+                if not done:
+                    with torch.no_grad():
+                        next_lossless = env.lossless_state_encoding_mdp(env.state)
+                        next_obs_arr = np.array([next_lossless[i].flatten() for i in range(num_agents)])
+                        next_obs_tensor = torch.tensor(next_obs_arr, dtype=torch.float32, device=device)
+                        _, _, _, next_val = model.get_action_and_value(next_obs_tensor)
+                        running_return = next_val.squeeze(-1)  # shape [2]
+
+                for t in reversed(range(batch_len)):
+                    running_return = batch_rewards[t] + gamma * running_return
+                    batch_returns[t] = running_return
+
+                # 4. Single Vectorized Forward Pass over Entire K-step Batch
+                # Reshape to 2D tensors for batch processing: [K * 2, feature_dim]
+                flat_obs = batch_obs.view(-1, obs_dim)
+                flat_actions = batch_actions.view(-1)
+                flat_returns = batch_returns.view(-1)
+
+                _, log_probs, entropy, values = model.get_action_and_value(flat_obs, action=flat_actions)
+                values = values.squeeze(-1)
+
+                # Advantage calculation against discounted return targets
+                advantages = flat_returns - values.detach()
+
+                # Calculate vectorized losses
+                actor_loss = -(log_probs * advantages).mean()
+                critic_loss = nn.functional.mse_loss(values, flat_returns)
+                entropy_loss = -entropy_coef * entropy.mean()
+
+                total_loss = actor_loss + 0.5 * critic_loss + entropy_loss
+
+                # 5. Backpropagation step
+                optimizer.zero_grad()
+                total_loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+                optimizer.step()
+
+                episode_total_reward += float(batch_rewards.sum().item())
+
+                # Log step performance
+                write_log(performance_log_path, {
+                    "timestamp": time.time(),
+                    "episode": episode + 1,
+                    "global_step": global_step,
+                    "env_reward": float(sparse_reward),
+                    "actor_loss": float(actor_loss.item()),
+                    "critic_loss": float(critic_loss.item()),
+                    "total_loss": float(total_loss.item())
+                })
+
+                # Clear rollout buffers
+                obs_buffer.clear()
+                actions_buffer.clear()
+                rewards_buffer.clear()
+                step_indices_buffer.clear()
+            if max_steps_per_episode and step_count >= max_steps_per_episode:
+                            print(f"[Step Limit] Episode {episode + 1} reached max step limit ({max_steps_per_episode}).")
+                            break
+
+        print(f"Episode {episode + 1}/{total_episodes} | Env Reward: {episode_env_reward:.2f} | Total Reward (Shaped + LLM): {episode_total_reward:.2f}")
+
+        # Model Checkpointing
         if (episode + 1) % 10 == 0:
-            print(f"Episode {episode + 1}/{total_episodes} | Total Reward: {episode_reward:.2f}")
+            checkpoint_path = os.path.join(checkpoint_dir, f"model_ep_{episode + 1}.pt")
+            torch.save(model.state_dict(), checkpoint_path)
+
+        if episode_env_reward > best_reward:
+            best_reward = episode_env_reward
+            torch.save(model.state_dict(), best_model_path)
+       
+
 
 if __name__ == "__main__":
-    train_overcooked_marl(layout_name="cramped_room", total_episodes=100, k_steps=20)
+    train_overcooked_marl(
+        layout_name="cramped_room",
+        total_episodes=5,
+        k_steps=50,
+        dry_run=False,
+        verbose_trajectory=True,
+        horizon=50
+    )
