@@ -1,0 +1,14 @@
+/opt/anaconda3/envs/marl_project/lib/python3.9/site-packages/pygame/pkgdata.py:25: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  from pkg_resources import resource_stream, resource_exists
+/opt/anaconda3/envs/marl_project/lib/python3.9/site-packages/google/auth/__init__.py:54: FutureWarning: You are using a Python version 3.9 past its end of life. Google will update google-auth with critical bug fixes on a best-effort basis, but not with any other fixes or features. Please upgrade your Python version, and then update google-auth.
+  warnings.warn(eol_message.format("3.9"), FutureWarning)
+/opt/anaconda3/envs/marl_project/lib/python3.9/site-packages/google/oauth2/__init__.py:40: FutureWarning: You are using a Python version 3.9 past its end of life. Google will update google-auth with critical bug fixes on a best-effort basis, but not with any other fixes or features. Please upgrade your Python version, and then update google-auth.
+  warnings.warn(eol_message.format("3.9"), FutureWarning)
+Episode 1
+Computing MotionPlanner
+[Step Limit] Episode 1 reached max step limit (20).
+Episode 1/1 | Env Reward: 0.00 | Total Reward (Shaped + LLM): 0.00
+PASS: 20 real environment steps and two policy updates
+PASS: Base rewards preserved with Gemini disabled
+PASS: Logged losses are finite
+Evidence folder: /Users/amukashrestha/Documents/MARL/5106_project/evidence/phase4/real_smoke_nvo88dxa

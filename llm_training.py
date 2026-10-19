@@ -7,12 +7,21 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.distributions.categorical import Categorical
-from pydantic import BaseModel, Field
+from reward_patching import (
+    CounterfactualRewardPatch,
+    CounterfactualFeedback,
+    apply_reward_patches,
+)
 
 # ----------------------------------------------------
 # 0. Import Local Overcooked AI Package
 # ----------------------------------------------------
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "overcooked_ai")))
+sys.path.insert(
+    0,
+    os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "overcooked_ai", "src")
+    ),
+)
 
 from overcooked_ai_py.mdp.overcooked_mdp import OvercookedGridworld
 from overcooked_ai_py.mdp.overcooked_env import OvercookedEnv
@@ -53,14 +62,6 @@ class ActorCritic(nn.Module):
 # ----------------------------------------------------
 # 2. Gemini Counterfactual Evaluator Setup
 # ----------------------------------------------------
-class CounterfactualRewardPatch(BaseModel):
-    step: int
-    agent_idx: int
-    reward_bonus: float = Field(description="Counterfactual reward modifier between -1.0 and 1.0")
-    reasoning: str = Field(description="Explanation of the counterfactual evaluation")
-
-class CounterfactualFeedback(BaseModel):
-    patches: list[CounterfactualRewardPatch]
 
 
 def write_log(filepath, data):
@@ -220,6 +221,11 @@ def train_overcooked_marl(
     trajectory_log_path = os.path.join(log_dir, "trajectory_log.jsonl")
     model_io_log_path = os.path.join(log_dir, "model_io_log.jsonl")
     performance_log_path = os.path.join(log_dir, "performance_log.jsonl")
+    patch_audit_log_path = os.path.join(log_dir, "reward_patch_audit.jsonl")
+    
+    trajectory_log_path = os.path.join(log_dir, "trajectory_log.jsonl")
+    model_io_log_path = os.path.join(log_dir, "model_io_log.jsonl")
+    patch_audit_log_path = os.path.join(log_dir, "reward_patch_audit.jsonl")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     gemini_client = genai.Client() if not dry_run else None
@@ -313,26 +319,55 @@ def train_overcooked_marl(
                     print(f"\n[Trajectory Log - Ep {episode + 1} | Steps {step_indices_buffer[0]}-{step_indices_buffer[-1]}]")
                     print(json.dumps(recent_window, indent=2))
 
-                # 1. Query Gemini for counterfactual reward adjustments
+                # 1. Query Gemini, validate patches, and audit rewards.
+                patches = []
+
                 if not dry_run and gemini_client:
                     current_time = time.time()
-                    time_since_last_call = current_time - last_gemini_call_time
+                    time_since_last_call = (
+                        current_time - last_gemini_call_time
+                    )
 
                     if time_since_last_call < MIN_GEMINI_INTERVAL:
-                        time.sleep(MIN_GEMINI_INTERVAL - time_since_last_call)
+                        time.sleep(
+                            MIN_GEMINI_INTERVAL - time_since_last_call
+                        )
 
                     patches = query_gemini_counterfactuals(
-                        gemini_client, recent_window, model_io_log_path, episode + 1, global_step
+                        gemini_client,
+                        recent_window,
+                        model_io_log_path,
+                        episode + 1,
+                        global_step,
                     )
                     last_gemini_call_time = time.time()
 
-                    # Apply LLM patches to historical buffer steps
-                    window_start_step = step_indices_buffer[0]
-                    for patch in patches:
-                        buffer_idx = patch.step - window_start_step
-                        if 0 <= buffer_idx < len(rewards_buffer):
-                            if 0 <= patch.agent_idx < num_agents:
-                                rewards_buffer[buffer_idx][patch.agent_idx] += patch.reward_bonus
+                base_rewards = [list(row) for row in rewards_buffer]
+
+                rewards_buffer, patch_audit = apply_reward_patches(
+                    base_rewards,
+                    step_indices_buffer,
+                    patches,
+                )
+
+                write_log(patch_audit_log_path, {
+                    "timestamp": time.time(),
+                    "episode": episode + 1,
+                    "global_step": global_step,
+                    "llm_enabled": not dry_run,
+                    "step_indices": list(step_indices_buffer),
+                    "base_rewards": base_rewards,
+                    "final_rewards": rewards_buffer,
+                    "patch_audit": patch_audit,
+                    "applied_count": sum(
+                        item["status"] == "applied"
+                        for item in patch_audit
+                    ),
+                    "rejected_count": sum(
+                        item["status"] == "rejected"
+                        for item in patch_audit
+                    ),
+                })
 
                 # 2. Vectorize buffers into single batched tensors
                 # Shapes: batch_obs -> [K, 2, obs_dim], batch_actions -> [K, 2], batch_rewards -> [K, 2]
