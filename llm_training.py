@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.distributions.categorical import Categorical
+from pydantic import ValidationError
 from reward_patching import (
     CounterfactualRewardPatch,
     CounterfactualFeedback,
@@ -119,11 +120,29 @@ def query_gemini_counterfactuals(
             "tokens": token_info
         })
 
-        if not response.text:
-            print("[Gemini API Warning] Empty response returned.")
+        if not response.text or not response.text.strip():
+            write_log(model_io_log_path, {
+                "timestamp": time.time(),
+                "episode": episode,
+                "global_step": global_step,
+                "status": "empty_response",
+            })
             return []
 
-        feedback = CounterfactualFeedback.model_validate_json(response.text)
+        try:
+            feedback = CounterfactualFeedback.model_validate_json(
+                response.text
+            )
+        except ValidationError as error:
+            write_log(model_io_log_path, {
+                "timestamp": time.time(),
+                "episode": episode,
+                "global_step": global_step,
+                "status": "invalid_feedback",
+                "error_message": str(error),
+            })
+            return []
+
         write_log(model_io_log_path, {
             "timestamp": time.time(),
             "episode": episode,
