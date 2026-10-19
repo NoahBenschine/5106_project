@@ -44,6 +44,23 @@ audits = read_jsonl("reward_patch_audit.jsonl")
 performance = read_jsonl("performance_log.jsonl")
 
 assert len(trajectory) == 20, "Expected 20 real environment steps"
+for index, entry in enumerate(trajectory):
+    record = entry["record"]
+    assert record["schema_version"] == 2
+    assert record["state_before"] is not None
+    assert record["state_after"] is not None
+    assert len(record["rewards"]["environment_shaping"]) == 2
+
+    if index:
+        previous = trajectory[index - 1]["record"]
+        assert previous["state_after"] == record["state_before"]
+
+for audit in audits:
+    for step, base_rewards in zip(
+        audit["step_indices"], audit["base_rewards"]
+    ):
+        recorded = trajectory[step - 1]["record"]
+        assert recorded["rewards"]["base_training_rewards"] == base_rewards
 assert len(audits) == 2, "Expected two reward-processing windows"
 assert len(performance) == 2, "Expected two policy updates"
 

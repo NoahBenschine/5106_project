@@ -12,6 +12,12 @@ import llm_training as training
 
 
 class FakeMDP:
+    terrain_mtx = [
+        list("XXPXX"),
+        list("O   O"),
+        list("X   X"),
+        list("XDXSX"),
+    ]
     @classmethod
     def from_layout_name(cls, name):
         return cls()
@@ -92,7 +98,7 @@ class TrainingIntegrationTests(unittest.TestCase):
             )
         )
 
-        def fake_record(env, actions, step_count, reward):
+        def fake_record(env, actions, step_count, reward, **kwargs):
             return {"step": step_count, "env_reward": float(reward)}
 
         with tempfile.TemporaryDirectory() as temporary:
@@ -111,6 +117,11 @@ class TrainingIntegrationTests(unittest.TestCase):
                     training.nn.functional,
                     "mse_loss",
                     side_effect=capture_mse,
+                ),
+                patch.object(
+                    training,
+                    "snapshot_state",
+                    side_effect=lambda state: {"mock_state": state},
                 ),
             ):
                 training.train_overcooked_marl(
@@ -161,9 +172,15 @@ class TrainingIntegrationTests(unittest.TestCase):
                 for line in (logs / "model_io_log.jsonl")
                 .read_text().splitlines()
             ]
-            self.assertEqual(len(model_io), 2)
-            self.assertTrue(
-                all(entry["status"] == "success" for entry in model_io)
+            self.assertEqual(len(model_io), 4)
+            self.assertEqual(
+                [entry["status"] for entry in model_io],
+                [
+                    "response_received",
+                    "validated",
+                    "response_received",
+                    "validated",
+                ],
             )
 
             destination = Path("evidence/phase4/mock_integration")
