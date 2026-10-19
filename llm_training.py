@@ -7,12 +7,26 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.distributions.categorical import Categorical
-from pydantic import BaseModel, Field
+from pydantic import ValidationError
+from reward_patching import (
+    CounterfactualRewardPatch,
+    CounterfactualFeedback,
+    apply_reward_patches,
+)
+from prompt_builder import (
+    build_environment_context,
+    build_counterfactual_prompt,
+)
 
 # ----------------------------------------------------
 # 0. Import Local Overcooked AI Package
 # ----------------------------------------------------
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "overcooked_ai")))
+sys.path.insert(
+    0,
+    os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "overcooked_ai", "src")
+    ),
+)
 
 from overcooked_ai_py.mdp.overcooked_mdp import OvercookedGridworld
 from overcooked_ai_py.mdp.overcooked_env import OvercookedEnv
@@ -53,14 +67,6 @@ class ActorCritic(nn.Module):
 # ----------------------------------------------------
 # 2. Gemini Counterfactual Evaluator Setup
 # ----------------------------------------------------
-class CounterfactualRewardPatch(BaseModel):
-    step: int
-    agent_idx: int
-    reward_bonus: float = Field(description="Counterfactual reward modifier between -1.0 and 1.0")
-    reasoning: str = Field(description="Explanation of the counterfactual evaluation")
-
-class CounterfactualFeedback(BaseModel):
-    patches: list[CounterfactualRewardPatch]
 
 
 def write_log(filepath, data):
@@ -68,21 +74,19 @@ def write_log(filepath, data):
     with open(filepath, "a", encoding="utf-8") as f:
         f.write(json.dumps(data) + "\n")
 
-
-def query_gemini_counterfactuals(client, trajectory_window, model_io_log_path, episode, global_step):
+def query_gemini_counterfactuals(
+    client,
+    trajectory_window,
+    model_io_log_path,
+    episode,
+    global_step,
+    environment_context=None,
+):
     """Sends recent K steps to Gemini for counterfactual reward adjustments and logs I/O."""
-    compact_trajectory = json.dumps(trajectory_window, separators=(",", ":"))
-
-    prompt = f"""You are an expert multi-agent RL credit assignment evaluator for Overcooked.
-Analyze this sequence of trajectory steps where two agents interact:
-
-{compact_trajectory}
-
-For each agent in the window, evaluate counterfactual actions:
-Did an agent perform a helpful intermediate action (e.g., placing soup ingredient, passing plate)
-that wasn't immediately rewarded by the environment? Or did they block the other agent?
-
-Return reward adjustments (between -1.0 and 1.0) for relevant steps."""
+    prompt = build_counterfactual_prompt(
+        trajectory_window,
+        environment_context,
+    )
 
     start_time = time.time()
     try:
@@ -109,18 +113,43 @@ Return reward adjustments (between -1.0 and 1.0) for relevant steps."""
             "timestamp": time.time(),
             "episode": episode,
             "global_step": global_step,
-            "status": "success",
+            "status": "response_received",
             "latency_sec": latency,
             "prompt": prompt,
             "raw_response": response.text,
             "tokens": token_info
         })
 
-        if not response.text:
-            print("[Gemini API Warning] Empty response returned.")
+        if not response.text or not response.text.strip():
+            write_log(model_io_log_path, {
+                "timestamp": time.time(),
+                "episode": episode,
+                "global_step": global_step,
+                "status": "empty_response",
+            })
             return []
 
-        feedback = CounterfactualFeedback.model_validate_json(response.text)
+        try:
+            feedback = CounterfactualFeedback.model_validate_json(
+                response.text
+            )
+        except ValidationError as error:
+            write_log(model_io_log_path, {
+                "timestamp": time.time(),
+                "episode": episode,
+                "global_step": global_step,
+                "status": "invalid_feedback",
+                "error_message": str(error),
+            })
+            return []
+
+        write_log(model_io_log_path, {
+            "timestamp": time.time(),
+            "episode": episode,
+            "global_step": global_step,
+            "status": "validated",
+            "patch_count": len(feedback.patches),
+        })
         return feedback.patches
 
     except APIError as e:
@@ -146,8 +175,25 @@ Return reward adjustments (between -1.0 and 1.0) for relevant steps."""
         })
         return []
 
+def snapshot_state(state):
+    """Create an independent, JSON-compatible state snapshot."""
+    def convert(value):
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+        if isinstance(value, np.generic):
+            return value.item()
+        raise TypeError(f"Cannot serialize {type(value).__name__}")
 
-def extract_rich_step_info(env, joint_action, step_count, reward):
+    return json.loads(json.dumps(state.to_dict(), default=convert))
+
+def extract_rich_step_info(
+    env,
+    joint_action,
+    step_count,
+    reward,
+    state_before=None,
+    info=None,
+):
     state = env.state
     mdp = env.mdp
     
@@ -184,11 +230,33 @@ def extract_rich_step_info(env, joint_action, step_count, reward):
                 "num_ingredients": 0
             })
 
+        info = info or {}
+    shaping = [
+        float(value)
+        for value in info.get("shaped_r_by_agent", [0.0, 0.0])
+    ]
+    individual_sparse = info.get("sparse_r_by_agent")
+
     return {
+        "schema_version": 2,
         "step": step_count,
         "env_reward": float(reward),
         "agents": agent_data,
-        "pots": pot_states
+        "pots": pot_states,
+        "state_before": state_before,
+        "state_after": snapshot_state(env.state),
+        "rewards": {
+            "team_sparse": float(reward),
+            "individual_sparse": (
+                [float(value) for value in individual_sparse]
+                if individual_sparse is not None else None
+            ),
+            "environment_shaping": shaping,
+            "base_training_rewards": [
+                float(reward) + value for value in shaping
+            ],
+        },
+        "agent_infos": info.get("agent_infos", []),
     }
 
 
@@ -216,16 +284,22 @@ def train_overcooked_marl(
 ):
     os.makedirs(log_dir, exist_ok=True)
     os.makedirs(checkpoint_dir, exist_ok=True)
-    
+
     trajectory_log_path = os.path.join(log_dir, "trajectory_log.jsonl")
     model_io_log_path = os.path.join(log_dir, "model_io_log.jsonl")
     performance_log_path = os.path.join(log_dir, "performance_log.jsonl")
+    patch_audit_log_path = os.path.join(log_dir, "reward_patch_audit.jsonl")
+    
+    trajectory_log_path = os.path.join(log_dir, "trajectory_log.jsonl")
+    model_io_log_path = os.path.join(log_dir, "model_io_log.jsonl")
+    patch_audit_log_path = os.path.join(log_dir, "reward_patch_audit.jsonl")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     gemini_client = genai.Client() if not dry_run else None
 
     MAX_STEPS_PER_EPISODE = 20 if DEBUG_MODE else horizon
     mdp = OvercookedGridworld.from_layout_name(layout_name)
+    environment_context = build_environment_context(mdp, layout_name)
     env = OvercookedEnv.from_mdp(mdp, horizon=horizon)
     
     num_agents = 2
@@ -285,6 +359,7 @@ def train_overcooked_marl(
                 actions, _, _, _ = model.get_action_and_value(obs_tensor)
 
             joint_action = tuple(Action.INDEX_TO_ACTION[a.item()] for a in actions)
+            state_before = snapshot_state(env.state)
             next_state, sparse_reward, done, info = env.step(joint_action)
             episode_env_reward += sparse_reward
 
@@ -296,7 +371,14 @@ def train_overcooked_marl(
             rewards_buffer.append(step_base_rewards)
             step_indices_buffer.append(step_count)
 
-            step_record = extract_rich_step_info(env, joint_action, step_count, sparse_reward)
+            step_record = extract_rich_step_info(
+                env,
+                joint_action,
+                step_count,
+                sparse_reward,
+                state_before=state_before,
+                info=info,
+            )
             trajectory_log.append(step_record)
 
             write_log(trajectory_log_path, {
@@ -313,26 +395,56 @@ def train_overcooked_marl(
                     print(f"\n[Trajectory Log - Ep {episode + 1} | Steps {step_indices_buffer[0]}-{step_indices_buffer[-1]}]")
                     print(json.dumps(recent_window, indent=2))
 
-                # 1. Query Gemini for counterfactual reward adjustments
+                # 1. Query Gemini, validate patches, and audit rewards.
+                patches = []
+
                 if not dry_run and gemini_client:
                     current_time = time.time()
-                    time_since_last_call = current_time - last_gemini_call_time
+                    time_since_last_call = (
+                        current_time - last_gemini_call_time
+                    )
 
                     if time_since_last_call < MIN_GEMINI_INTERVAL:
-                        time.sleep(MIN_GEMINI_INTERVAL - time_since_last_call)
+                        time.sleep(
+                            MIN_GEMINI_INTERVAL - time_since_last_call
+                        )
 
                     patches = query_gemini_counterfactuals(
-                        gemini_client, recent_window, model_io_log_path, episode + 1, global_step
+                        gemini_client,
+                        recent_window,
+                        model_io_log_path,
+                        episode + 1,
+                        global_step,
+                        environment_context=environment_context,
                     )
                     last_gemini_call_time = time.time()
 
-                    # Apply LLM patches to historical buffer steps
-                    window_start_step = step_indices_buffer[0]
-                    for patch in patches:
-                        buffer_idx = patch.step - window_start_step
-                        if 0 <= buffer_idx < len(rewards_buffer):
-                            if 0 <= patch.agent_idx < num_agents:
-                                rewards_buffer[buffer_idx][patch.agent_idx] += patch.reward_bonus
+                base_rewards = [list(row) for row in rewards_buffer]
+
+                rewards_buffer, patch_audit = apply_reward_patches(
+                    base_rewards,
+                    step_indices_buffer,
+                    patches,
+                )
+
+                write_log(patch_audit_log_path, {
+                    "timestamp": time.time(),
+                    "episode": episode + 1,
+                    "global_step": global_step,
+                    "llm_enabled": not dry_run,
+                    "step_indices": list(step_indices_buffer),
+                    "base_rewards": base_rewards,
+                    "final_rewards": rewards_buffer,
+                    "patch_audit": patch_audit,
+                    "applied_count": sum(
+                        item["status"] == "applied"
+                        for item in patch_audit
+                    ),
+                    "rejected_count": sum(
+                        item["status"] == "rejected"
+                        for item in patch_audit
+                    ),
+                })
 
                 # 2. Vectorize buffers into single batched tensors
                 # Shapes: batch_obs -> [K, 2, obs_dim], batch_actions -> [K, 2], batch_rewards -> [K, 2]

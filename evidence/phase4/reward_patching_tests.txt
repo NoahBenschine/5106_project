@@ -1,0 +1,10 @@
+test_correct_agent_and_step (test_reward_patching.RewardPatchingTests) ... ok
+test_duplicate_target_applied_once (test_reward_patching.RewardPatchingTests) ... ok
+test_empty_feedback_preserves_rewards (test_reward_patching.RewardPatchingTests) ... ok
+test_invalid_patches_leave_rewards_unchanged (test_reward_patching.RewardPatchingTests) ... ok
+test_nonconsecutive_step_mapping (test_reward_patching.RewardPatchingTests) ... ok
+
+----------------------------------------------------------------------
+Ran 5 tests in 0.004s
+
+OK
