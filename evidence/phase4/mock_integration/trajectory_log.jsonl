@@ -1,0 +1,4 @@
+{"episode": 1, "global_step": 1, "record": {"step": 1, "env_reward": 0.0}}
+{"episode": 1, "global_step": 2, "record": {"step": 2, "env_reward": 0.0}}
+{"episode": 1, "global_step": 3, "record": {"step": 3, "env_reward": 0.0}}
+{"episode": 1, "global_step": 4, "record": {"step": 4, "env_reward": 20.0}}

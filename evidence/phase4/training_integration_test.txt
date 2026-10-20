@@ -1,0 +1,16 @@
+/opt/anaconda3/envs/marl_project/lib/python3.9/site-packages/pygame/pkgdata.py:25: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  from pkg_resources import resource_stream, resource_exists
+/opt/anaconda3/envs/marl_project/lib/python3.9/site-packages/google/auth/__init__.py:54: FutureWarning: You are using a Python version 3.9 past its end of life. Google will update google-auth with critical bug fixes on a best-effort basis, but not with any other fixes or features. Please upgrade your Python version, and then update google-auth.
+  warnings.warn(eol_message.format("3.9"), FutureWarning)
+/opt/anaconda3/envs/marl_project/lib/python3.9/site-packages/google/oauth2/__init__.py:40: FutureWarning: You are using a Python version 3.9 past its end of life. Google will update google-auth with critical bug fixes on a best-effort basis, but not with any other fixes or features. Please upgrade your Python version, and then update google-auth.
+  warnings.warn(eol_message.format("3.9"), FutureWarning)
+test_mock_feedback_reaches_learner (test_training_integration.TrainingIntegrationTests) ... ok
+
+----------------------------------------------------------------------
+Ran 1 test in 1.045s
+
+OK
+Episode 1
+[Step Limit] Episode 1 reached max step limit (4).
+Episode 1/1 | Env Reward: 20.00 | Total Reward (Shaped + LLM): 40.50
+Verified: mock JSON -> validated rewards -> critic targets

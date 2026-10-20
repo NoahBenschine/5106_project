@@ -1,0 +1,17 @@
+/opt/anaconda3/envs/marl_project/lib/python3.9/site-packages/pygame/pkgdata.py:25: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  from pkg_resources import resource_stream, resource_exists
+/opt/anaconda3/envs/marl_project/lib/python3.9/site-packages/google/auth/__init__.py:54: FutureWarning: You are using a Python version 3.9 past its end of life. Google will update google-auth with critical bug fixes on a best-effort basis, but not with any other fixes or features. Please upgrade your Python version, and then update google-auth.
+  warnings.warn(eol_message.format("3.9"), FutureWarning)
+/opt/anaconda3/envs/marl_project/lib/python3.9/site-packages/google/oauth2/__init__.py:40: FutureWarning: You are using a Python version 3.9 past its end of life. Google will update google-auth with critical bug fixes on a best-effort basis, but not with any other fixes or features. Please upgrade your Python version, and then update google-auth.
+  warnings.warn(eol_message.format("3.9"), FutureWarning)
+Overcooked source: /Users/amukashrestha/Documents/MARL/5106_project/overcooked_ai/src/overcooked_ai_py/__init__.py
+Environment has encoding method: True
+MDP has encoding method: False
+Computing MotionPlanner
+Computing MotionPlanner to be saved in /Users/amukashrestha/Documents/MARL/5106_project/overcooked_ai/src/overcooked_ai_py/data/planners/cramped_room_mp.pkl
+It took 0.020251989364624023 seconds to create mp
+Number of step return values: 4
+Step return types: ['OvercookedState', 'int', 'bool', 'dict']
+
+Environment step signature:
+(joint_action, joint_agent_action_info=None, display_phi=False)

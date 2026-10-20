@@ -1,0 +1,2 @@
+{"timestamp": 1792371897.1533928, "episode": 1, "global_step": 10, "env_reward": 0.0, "actor_loss": 0.015965735539793968, "critic_loss": 9.295853669755161e-05, "total_loss": -0.0018942393362522125}
+{"timestamp": 1792371897.162115, "episode": 1, "global_step": 20, "env_reward": 0.0, "actor_loss": -0.14329853653907776, "critic_loss": 0.0064816721715033054, "total_loss": -0.1579640656709671}
