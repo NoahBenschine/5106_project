@@ -69,30 +69,64 @@ def write_log(filepath, data):
         f.write(json.dumps(data) + "\n")
 
 
+
+def format_trajectory_to_natural_language(trajectory_window):
+    """Converts raw step JSON objects into a concise, token-efficient natural language string."""
+    lines = []
+    for step_data in trajectory_window:
+        step_num = step_data["step"]
+        r_env = step_data.get("env_reward", 0.0)
+        
+        # Format Agents
+        ag_strings = []
+        for ag_key, ag in step_data["agents"].items():
+            ag_idx = ag_key.split("_")[-1]
+            holding = ag.get("holding", "empty")
+            action = ag.get("action", "stay")
+            pos = tuple(ag.get("pos", [0, 0]))
+            ag_strings.append(f"Ag{ag_idx} at {pos} holding {holding} took action '{action}'")
+        
+        agents_str = "; ".join(ag_strings)
+
+        # Format Pots (Only include active/cooking/ready pots to save tokens)
+        pot_strings = []
+        for pot in step_data.get("pots", []):
+            if not pot.get("is_empty", True):
+                p_pos = tuple(pot["pos"])
+                n_ing = pot.get("num_ingredients", 0)
+                status = "ready" if pot.get("is_ready") else ("cooking" if pot.get("is_cooking") else f"{n_ing}/3 ingr")
+                pot_strings.append(f"Pot at {p_pos}: {status}")
+        
+        pots_str = f" | Pots: {', '.join(pot_strings)}" if pot_strings else ""
+        lines.append(f"Step {step_num} (Env Reward: {r_env}): {agents_str}{pots_str}")
+
+    return "\n".join(lines)
+
+    y
+
 def query_gemini_counterfactuals(client, trajectory_window, model_io_log_path, episode, global_step):
-    """Sends recent K steps to Gemini for counterfactual reward adjustments and logs I/O."""
-    compact_trajectory = json.dumps(trajectory_window, separators=(",", ":"))
+    """Sends recent K steps formatted as compact natural language lines to Gemini."""
+    
+    # Convert window to natural language string
+    compact_trajectory_str = format_trajectory_to_natural_language(trajectory_window)
+    prompt = f"""Analyze this sequence of Overcooked agent trajectory steps:
 
-    prompt = f"""You are an expert multi-agent RL credit assignment evaluator for Overcooked.
-Analyze this sequence of trajectory steps where two agents interact:
+{compact_trajectory_str}
 
-{compact_trajectory}
-
-For each agent in the window, evaluate counterfactual actions:
-Did an agent perform a helpful intermediate action (e.g., placing soup ingredient, passing plate)
-that wasn't immediately rewarded by the environment? Or did they block the other agent?
-
-Return reward adjustments (between -1.0 and 1.0) for relevant steps."""
+Task: Evaluate counterfactual actions for each agent.
+- Assign a positive bonus (+0.1 to +1.0) if an agent performed a helpful intermediate action (e.g., placing an ingredient in a pot, fetching a plate) that was not rewarded by the environment.
+- Assign a negative penalty (-0.1 to -1.0) if an agent blocked the other agent or acted passively.
+- Ignore routine movement steps. Return reward adjustments only for steps with notable contribution or hindrance."""
 
     start_time = time.time()
     try:
         response = client.models.generate_content(
-            model="gemini-3.5-flash-lite",  # Updated to Flash Lite for higher daily limits (500 RPD)
+            model="gemini-3.5-flash-lite",
             contents=prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
                 response_schema=CounterfactualFeedback,
-                temperature=0.2,
+                temperature=0.1,
             ),
         )
 
@@ -194,10 +228,9 @@ def extract_rich_step_info(env, joint_action, step_count, reward):
 
 # Environment / Execution Config
 DEBUG_MODE = False
-
 MIN_GEMINI_INTERVAL = 6.0
 
-
+SAVE_INTERVAL = 25
 # ----------------------------------------------------
 # 3. Main Training Loop
 # ----------------------------------------------------
@@ -205,6 +238,7 @@ def train_overcooked_marl(
     layout_name="cramped_room",
     total_episodes=200,
     k_steps=400,
+    num_agents=2,
     dry_run=True,
     verbose_trajectory=True,
     max_episode_seconds=45.0,
@@ -225,10 +259,17 @@ def train_overcooked_marl(
     gemini_client = genai.Client() if not dry_run else None
 
     MAX_STEPS_PER_EPISODE = 20 if DEBUG_MODE else horizon
-    mdp = OvercookedGridworld.from_layout_name(layout_name)
+    
+    # Configure reward shaping parameters explicitly for sub-task feedback
+    reward_shaping_params = {
+        "PLACEMENT_IN_POT_REW": 3.0,
+        "DISH_PICKUP_REWR": 3.0,
+        "SOUP_PICKUP_REWR": 5.0
+    }
+    mdp = OvercookedGridworld.from_layout_name(layout_name, reward_shaping_params=reward_shaping_params)
     env = OvercookedEnv.from_mdp(mdp, horizon=horizon)
     
-    num_agents = 2
+    num_agents = 3
     action_dim = len(Action.ALL_ACTIONS)
     
     env.reset()
@@ -239,11 +280,23 @@ def train_overcooked_marl(
     model = ActorCritic(obs_dim, action_dim).to(device)
     optimizer = optim.Adam(model.parameters(), lr=3e-4)
 
-    # Resume weights from checkpoint if available
+    # ----------------------------------------------------
+    # PLACE 1: RESUME LOADING LOGIC (Before Episode Loop)
+    # ----------------------------------------------------
+    latest_checkpoint_path = os.path.join(checkpoint_dir, "latest_checkpoint.pt")
     best_model_path = os.path.join(checkpoint_dir, "best_model.pt")
-    if os.path.exists(best_model_path):
-        model.load_state_dict(torch.load(best_model_path, map_location=device))
-        print(f"--> Resumed training from checkpoint: {best_model_path}")
+    
+    start_episode = 0
+    best_reward = -float("inf")
+
+    # Check and load from the latest continuous training state if available
+    if os.path.exists(latest_checkpoint_path):
+        checkpoint = torch.load(latest_checkpoint_path, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        best_reward = checkpoint.get('best_reward', -float("inf"))
+        start_episode = checkpoint.get('episode', 0)
+        print(f"--> Resumed training from Episode {start_episode} with Best Reward: {best_reward:.2f}")
 
     max_steps_per_episode = MAX_STEPS_PER_EPISODE
     last_gemini_call_time = 0
@@ -258,6 +311,12 @@ def train_overcooked_marl(
         episode_start_time = time.time()
         done = False
 
+        # Profiling accumulators per episode (in seconds)
+        time_env_step = 0.0
+        time_llm_eval = 0.0
+        time_return_calc = 0.0
+        time_policy_update = 0.0
+
         # Rollout buffers
         obs_buffer = []          # List of tensors shape [2, obs_dim]
         actions_buffer = []      # List of tensors shape [2]
@@ -265,19 +324,22 @@ def train_overcooked_marl(
         step_indices_buffer = [] # Step numbers
         trajectory_log = []
 
-        print(f"Episode {episode + 1}")
+        print(f"\n--- Starting Episode {episode + 1}/{total_episodes} ---")
 
         while not done:
             step_count += 1
             global_step += 1
 
-          
-
             if time.time() - episode_start_time > max_episode_seconds:
                 print(f"[Timeout] Episode {episode + 1} exceeded {max_episode_seconds}s limit.")
                 break
 
+            # --- STEP 1: Environment Rollout Execution ---
+            t_env_start = time.time()
             lossless_obs = env.lossless_state_encoding_mdp(env.state)
+            print(lossless_obs)
+            print("type:", type(lossless_obs))
+            print("len/shape:", len(lossless_obs) if isinstance(lossless_obs, (list, tuple)) else lossless_obs.shape)
             obs_array = np.array([lossless_obs[i].flatten() for i in range(num_agents)])
             obs_tensor = torch.tensor(obs_array, dtype=torch.float32).to(device)
 
@@ -304,28 +366,33 @@ def train_overcooked_marl(
                 "global_step": global_step,
                 "record": step_record
             })
+            time_env_step += (time.time() - t_env_start)
 
             # --- Process Batch & Update Policy Every K Steps (or Episode End) ---
             if step_count % k_steps == 0 or done or step_count >= max_steps_per_episode:
                 recent_window = trajectory_log[-len(obs_buffer):]
 
                 if verbose_trajectory:
-                    print(f"\n[Trajectory Log - Ep {episode + 1} | Steps {step_indices_buffer[0]}-{step_indices_buffer[-1]}]")
-                    print(json.dumps(recent_window, indent=2))
+                    print(f"[Trajectory Log - Ep {episode + 1} | Steps {step_indices_buffer[0]}-{step_indices_buffer[-1]}]")
 
-                # 1. Query Gemini for counterfactual reward adjustments
+                # --- STEP 2: Query Gemini for Counterfactual Feedback ---
+                t_llm_start = time.time()
                 if not dry_run and gemini_client:
                     current_time = time.time()
                     time_since_last_call = current_time - last_gemini_call_time
-
+                    print(current_time)
                     if time_since_last_call < MIN_GEMINI_INTERVAL:
                         time.sleep(MIN_GEMINI_INTERVAL - time_since_last_call)
-
+                    new_time = time.time()
+                    print(new_time)
+                    print("time spent sleeping:")
+                    print(new_time - current_time)
                     patches = query_gemini_counterfactuals(
                         gemini_client, recent_window, model_io_log_path, episode + 1, global_step
                     )
                     last_gemini_call_time = time.time()
-
+                    print("Time taken for gemini counterfactual:")
+                    print(last_gemini_call_time - new_time)
                     # Apply LLM patches to historical buffer steps
                     window_start_step = step_indices_buffer[0]
                     for patch in patches:
@@ -333,34 +400,33 @@ def train_overcooked_marl(
                         if 0 <= buffer_idx < len(rewards_buffer):
                             if 0 <= patch.agent_idx < num_agents:
                                 rewards_buffer[buffer_idx][patch.agent_idx] += patch.reward_bonus
+                time_llm_eval += (time.time() - t_llm_start)
 
-                # 2. Vectorize buffers into single batched tensors
-                # Shapes: batch_obs -> [K, 2, obs_dim], batch_actions -> [K, 2], batch_rewards -> [K, 2]
+                # --- STEP 3: Return & Advantage Computation ---
+                t_return_start = time.time()
                 batch_obs = torch.stack(obs_buffer).to(device)
                 batch_actions = torch.stack(actions_buffer).to(device)
                 batch_rewards = torch.tensor(rewards_buffer, dtype=torch.float32, device=device)
 
                 batch_len = len(obs_buffer)
-
-                # 3. Compute discounted return targets (R_t) backward across the buffer
                 batch_returns = torch.zeros_like(batch_rewards)
                 running_return = torch.zeros(num_agents, device=device)
 
-                # Bootstrapping: If not done, estimate future value using critic on the next observation
                 if not done:
                     with torch.no_grad():
                         next_lossless = env.lossless_state_encoding_mdp(env.state)
                         next_obs_arr = np.array([next_lossless[i].flatten() for i in range(num_agents)])
                         next_obs_tensor = torch.tensor(next_obs_arr, dtype=torch.float32, device=device)
                         _, _, _, next_val = model.get_action_and_value(next_obs_tensor)
-                        running_return = next_val.squeeze(-1)  # shape [2]
+                        running_return = next_val.squeeze(-1)
 
                 for t in reversed(range(batch_len)):
                     running_return = batch_rewards[t] + gamma * running_return
                     batch_returns[t] = running_return
+                time_return_calc += (time.time() - t_return_start)
 
-                # 4. Single Vectorized Forward Pass over Entire K-step Batch
-                # Reshape to 2D tensors for batch processing: [K * 2, feature_dim]
+                # --- STEP 4: Policy Loss Calculation & Backpropagation ---
+                t_update_start = time.time()
                 flat_obs = batch_obs.view(-1, obs_dim)
                 flat_actions = batch_actions.view(-1)
                 flat_returns = batch_returns.view(-1)
@@ -368,23 +434,21 @@ def train_overcooked_marl(
                 _, log_probs, entropy, values = model.get_action_and_value(flat_obs, action=flat_actions)
                 values = values.squeeze(-1)
 
-                # Advantage calculation against discounted return targets
                 advantages = flat_returns - values.detach()
 
-                # Calculate vectorized losses
                 actor_loss = -(log_probs * advantages).mean()
                 critic_loss = nn.functional.mse_loss(values, flat_returns)
                 entropy_loss = -entropy_coef * entropy.mean()
 
                 total_loss = actor_loss + 0.5 * critic_loss + entropy_loss
 
-                # 5. Backpropagation step
                 optimizer.zero_grad()
                 total_loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
                 optimizer.step()
 
                 episode_total_reward += float(batch_rewards.sum().item())
+                time_policy_update += (time.time() - t_update_start)
 
                 # Log step performance
                 write_log(performance_log_path, {
@@ -394,7 +458,13 @@ def train_overcooked_marl(
                     "env_reward": float(sparse_reward),
                     "actor_loss": float(actor_loss.item()),
                     "critic_loss": float(critic_loss.item()),
-                    "total_loss": float(total_loss.item())
+                    "total_loss": float(total_loss.item()),
+                    "time_metrics": {
+                        "env_step_sec": time_env_step,
+                        "llm_eval_sec": time_llm_eval,
+                        "return_calc_sec": time_return_calc,
+                        "policy_update_sec": time_policy_update
+                    }
                 })
 
                 # Clear rollout buffers
@@ -402,29 +472,49 @@ def train_overcooked_marl(
                 actions_buffer.clear()
                 rewards_buffer.clear()
                 step_indices_buffer.clear()
+
             if max_steps_per_episode and step_count >= max_steps_per_episode:
-                            print(f"[Step Limit] Episode {episode + 1} reached max step limit ({max_steps_per_episode}).")
-                            break
+                print(f"[Step Limit] Episode {episode + 1} reached max step limit ({max_steps_per_episode}).")
+                break
 
-        print(f"Episode {episode + 1}/{total_episodes} | Env Reward: {episode_env_reward:.2f} | Total Reward (Shaped + LLM): {episode_total_reward:.2f}")
+        # Display Summary Timing Info for Episode
+        total_ep_time = time.time() - episode_start_time
+        print(f"\n--- Episode {episode + 1} Summary ---")
+        print(f"Env Reward: {episode_env_reward:.2f} | Total Reward (Shaped + LLM): {episode_total_reward:.2f}")
+        print(f"Total Time: {total_ep_time:.2f}s")
+        print(f"  ├─ Step 1 (Env Rollout Execution)     : {time_env_step:.4f}s ({time_env_step/total_ep_time*100:.1f}%)")
+        print(f"  ├─ Step 2 (Gemini LLM Credit Feedback): {time_llm_eval:.4f}s ({time_llm_eval/total_ep_time*100:.1f}%)")
+        print(f"  ├─ Step 3 (Returns & Advantage Calc) : {time_return_calc:.4f}s ({time_return_calc/total_ep_time*100:.1f}%)")
+        print(f"  └─ Step 4 (Backprop & Policy Update)  : {time_policy_update:.4f}s ({time_policy_update/total_ep_time*100:.1f}%)")
 
-        # Model Checkpointing
-        if (episode + 1) % 10 == 0:
-            checkpoint_path = os.path.join(checkpoint_dir, f"model_ep_{episode + 1}.pt")
-            torch.save(model.state_dict(), checkpoint_path)
+        # 1. Periodically save latest training state for seamless resuming
+        if (episode + 1) % SAVE_INTERVAL == 0 or (episode + 1) == total_episodes:
+            torch.save({
+                'episode': episode + 1,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'best_reward': best_reward
+            }, latest_checkpoint_path)
+            print(f" Saved training state to {latest_checkpoint_path}")
 
+        # 2. Save best performing model ONLY when environment reward achieves a new peak
         if episode_env_reward > best_reward:
+            print(f" All-time high reward! ({best_reward:.2f} -> {episode_env_reward:.2f}). Updating best_model.pt...")
             best_reward = episode_env_reward
-            torch.save(model.state_dict(), best_model_path)
-       
+            torch.save({
+                'episode': episode + 1,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'best_reward': best_reward
+            }, best_model_path)
 
 
 if __name__ == "__main__":
     train_overcooked_marl(
         layout_name="cramped_room",
         total_episodes=5,
-        k_steps=50,
+        k_steps=400,
         dry_run=False,
-        verbose_trajectory=True,
-        horizon=50
+        verbose_trajectory=False,
+        horizon=400  # Set horizon to standard 400 steps
     )
