@@ -8,6 +8,8 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.distributions.categorical import Categorical
 from pydantic import ValidationError
+import ollama
+
 
 from reward_patching import (
     CounterfactualRewardPatch,
@@ -115,27 +117,47 @@ def query_gemini_counterfactuals(
         trajectory_window,
         environment_context,
     )
-
+    print(prompt)
     start_time = time.time()
     try:
-        response = client.models.generate_content(
-            model="gemini-3.5-flash-lite",
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=CounterfactualFeedback,
-                temperature=0.1,
-            ),
+
+        options = {
+            "num_ctx": 2048,      # Keep context minimal to speed up prompt processing
+            "num_predict": 80,    # Cap max output tokens
+            "num_thread": 6,      # Match your physical performance cores (avoid hyperthreads)
+            "temperature": 0.1,       # Drop from 128 to 64 tokens (66 tokens generated took 4.4s)
+            "use_mmap": True,          # Keeps model loaded in RAM
+            "use_mlock": True,         # Prevents OS from swapping model memory to disk
+            "flash_attn": True,        # Enables fast attention kernels for prefill
+        }
+        response = ollama.chat(
+            model="qwen2.5:1.5b", # or "qwen2.5:7b"
+            messages=[{"role": "user", "content": prompt}],
+            format="json", # Forces structured JSON output
+            keep_alive="24h",  # Keeps model warm in RAM for the entire training run
+            options=options
         )
 
         latency = time.time() - start_time
-        usage = response.usage_metadata
+        # Convert nanoseconds to seconds
+        prompt_eval_time = response.get('prompt_eval_duration', 0) / 1e9  # Input processing time
+        eval_time = response.get('eval_duration', 0) / 1e9                # Output generation time
+        prompt_tokens = response.get('prompt_eval_count', 0)
+        eval_tokens = response.get('eval_count', 0)
+
+        print(f"Input Processing: {prompt_eval_time:.2f}s ({prompt_tokens} tokens)")
+        print(f"Output Generation: {eval_time:.2f}s ({eval_tokens} tokens @ {eval_tokens/eval_time:.1f} t/s)")
         token_info = {
-            "prompt_tokens": usage.prompt_token_count if usage else 0,
-            "candidates_tokens": usage.candidates_token_count if usage else 0,
-            "total_tokens": usage.total_token_count if usage else 0,
+            "prompt_tokens": prompt_tokens,
+            "candidates_tokens": eval_tokens,
+            "total_tokens": prompt_tokens + eval_tokens,
         }
 
+        # Extract JSON content from Ollama response
+        if hasattr(response, 'message'):
+            raw_json = response.message.content
+        else:
+            raw_json = response['message']['content']
         # Log LLM I/O detail
         write_log(model_io_log_path, {
             "timestamp": time.time(),
@@ -144,11 +166,11 @@ def query_gemini_counterfactuals(
             "status": "response_received",
             "latency_sec": latency,
             "prompt": prompt,
-            "raw_response": response.text,
+            "raw_response": raw_json,
             "tokens": token_info
         })
 
-        if not response.text or not response.text.strip():
+        if not raw_json:
             write_log(model_io_log_path, {
                 "timestamp": time.time(),
                 "episode": episode,
@@ -158,7 +180,7 @@ def query_gemini_counterfactuals(
             return []
 
         try:
-            feedback = CounterfactualFeedback.model_validate_json(response.text)
+            feedback = CounterfactualFeedback.model_validate_json(raw_json)
         except ValidationError as error:
             write_log(model_io_log_path, {
                 "timestamp": time.time(),
@@ -225,68 +247,95 @@ def extract_rich_step_info(
     state = env.state
     mdp = env.mdp
     
-    action_names = [str(a) for a in joint_action]
-    
+    # Map raw action tuples to concise string representations
+    ACTION_MAP = {
+        (0, -1): "up",
+        (0, 1): "down",
+        (1, 0): "right",
+        (-1, 0): "left",
+        (0, 0): "stay",
+        "interact": "interact"
+    }
+
     agent_data = {}
     for i, player in enumerate(state.players):
-        held_obj = player.held_object.name if player.has_object() else "empty"
-        agent_data[f"agent_{i}"] = {
+        held = player.held_object.name if player.has_object() else "empty"
+        act = joint_action[i] if joint_action else (0, 0)
+        act_str = ACTION_MAP.get(act, str(act))
+        
+        agent_data[f"a{i}"] = {
             "pos": list(player.position),
-            "orientation": list(player.orientation),
-            "holding": held_obj,
-            "action": action_names[i]
+            "hold": held,
+            "act": act_str
         }
-    
-    pot_states = []
-    pot_locations = mdp.get_pot_locations()
-    
-    for pot_pos in pot_locations:
+
+    # Only include pots that contain ingredients or are cooking/ready
+    active_pots = []
+    for pot_pos in mdp.get_pot_locations():
         if state.has_object(pot_pos):
             obj = state.get_object(pot_pos)
-            pot_states.append({
+            active_pots.append({
                 "pos": list(pot_pos),
-                "is_empty": False,
-                "soup_type": obj.name,
-                "num_ingredients": len(obj.ingredients),
-                "is_cooking": obj.is_cooking if hasattr(obj, "is_cooking") else False,
-                "is_ready": obj.is_ready if hasattr(obj, "is_ready") else False
-            })
-        else:
-            pot_states.append({
-                "pos": list(pot_pos),
-                "is_empty": True,
-                "num_ingredients": 0
+                "items": len(obj.ingredients),
+                "ready": getattr(obj, "is_ready", False),
+                "cooking": getattr(obj, "is_cooking", False)
             })
 
     info = info or {}
-    shaping = [
-        float(value)
-        for value in info.get("shaped_r_by_agent", [0.0, 0.0])
-    ]
-    individual_sparse = info.get("sparse_r_by_agent")
+    shaping = [float(v) for v in info.get("shaped_r_by_agent", [0.0, 0.0])]
 
+    # Streamlined dictionary output
     return {
-        "schema_version": 2,
         "step": step_count,
-        "env_reward": float(reward),
         "agents": agent_data,
-        "pots": pot_states,
-        "state_before": state_before,
-        "state_after": snapshot_state(env.state),
-        "rewards": {
-            "team_sparse": float(reward),
-            "individual_sparse": (
-                [float(value) for value in individual_sparse]
-                if individual_sparse is not None else None
-            ),
-            "environment_shaping": shaping,
-            "base_training_rewards": [
-                float(reward) + value for value in shaping
-            ],
-        },
-        "agent_infos": info.get("agent_infos", []),
+        "pots": active_pots,
+        "sparse": float(reward),
+        "shaping": shaping
     }
 
+# def extract_rich_step_info(env, joint_action, step_count, sparse_reward, state_before=None, info=None):
+#     # 1. Fallback to current env state if state_before wasn't passed
+#     state = state_before if state_before is not None else env.state
+    
+#     # 2. Extract slim agent state from state.players and joint_action
+#     slim_agents = {}
+#     for idx, player in enumerate(state.players):
+#         # Action taken by this specific agent in the joint tuple
+#         act = joint_action[idx] if joint_action and len(joint_action) > idx else None
+        
+#         slim_agents[f"a{idx}"] = {
+#             "pos": list(player.position),
+#             "dir": list(player.orientation),
+#             "act": str(act)
+#         }
+
+#     # 3. Extract active pots from state.objects
+#     active_pots = {}
+#     for pos, obj in state.objects.items():
+#         if obj.name == "soup":
+#             # Only record pots that have ingredients or are actively cooking
+#             num_items = len(obj.ingredients)
+#             is_cooking = getattr(obj, "is_cooking", False) or getattr(obj, "is_ready", False)
+            
+#             if num_items > 0 or is_cooking:
+#                 active_pots[f"pot_{pos[0]}_{pos[1]}"] = {
+#                     "pos": list(pos),
+#                     "items": num_items,
+#                     "timer": getattr(obj, "cook_time", 0)
+#                 }
+
+#     # 4. Extract environment shaping rewards safely from info
+#     shaping = [0.0, 0.0]
+#     if info and "shaped_r_by_agent" in info:
+#         shaping = [float(r) for r in info["shaped_r_by_agent"]]
+
+#     return {
+#         "step": step_count,
+#         "agents": slim_agents,
+#         "pots": active_pots,
+#         "sparse": float(sparse_reward),
+#         "shaping": shaping,
+#     }
 
 # Environment / Execution Config
 DEBUG_MODE = False
@@ -305,7 +354,7 @@ def train_overcooked_marl(
     verbose_trajectory=True,
     max_episode_seconds=45.0,
     log_dir="logs",
-    checkpoint_dir="checkpoints",
+    checkpoint_dir="checkpoints/cnn",
     horizon=400,
     gamma=0.99,            # Discount factor for return computation
     entropy_coef=0.01      # Encourages exploration
@@ -335,6 +384,12 @@ def train_overcooked_marl(
     
     # Initialize CNN Actor-Critic network
     model = ActorCritic(in_channels, action_dim).to(device)
+
+    # Trigger lazy initialization of fc, actor, and critic BEFORE loading weights
+    dummy_obs = torch.tensor(np.array([sample_obs[0]]), dtype=torch.float32).to(device)
+    with torch.no_grad():
+        model.get_action_and_value(dummy_obs)
+
     optimizer = optim.Adam(model.parameters(), lr=3e-4)
 
     # ----------------------------------------------------
@@ -429,14 +484,19 @@ def train_overcooked_marl(
                 "record": step_record
             })
             time_env_step += (time.time() - t_env_start)
-
+            # lookback_steps = 10
+            llm_window_size = 10
             # --- Process Batch & Update Policy Every K Steps (or Episode End) ---
-            if step_count % k_steps == 0 or done or step_count >= max_steps_per_episode:
-                recent_window = trajectory_log[-len(obs_buffer):]
+            if step_count % k_steps == 0 or done:
+                batch_len = len(obs_buffer)
+                recent_window = trajectory_log[-llm_window_size:]
 
                 if verbose_trajectory:
-                    print(f"[Trajectory Log - Ep {episode + 1} | Steps {step_indices_buffer[0]}-{step_indices_buffer[-1]}]")
-
+                    print(
+                        f"[Trajectory Log - Ep {episode + 1} | "
+                        f"Patching Steps {step_indices_buffer[0]}-{step_indices_buffer[-1]} | "
+                        f"Context Steps {recent_window[0]['step']}-{recent_window[-1]['step']}]"
+                    )
                 # --- STEP 2: Query Counterfactual Feedback ---
                 t_llm_start = time.time()
                 patches = []
@@ -445,8 +505,6 @@ def train_overcooked_marl(
                     current_time = time.time()
                     time_since_last_call = current_time - last_gemini_call_time
 
-                    if time_since_last_call < MIN_GEMINI_INTERVAL:
-                        time.sleep(MIN_GEMINI_INTERVAL - time_since_last_call)
 
                     patches = query_gemini_counterfactuals(
                         gemini_client,
@@ -520,6 +578,8 @@ def train_overcooked_marl(
                 values = values.squeeze(-1)
 
                 advantages = flat_returns - values.detach()
+                if advantages.numel() > 1:
+                    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
                 actor_loss = -(log_probs * advantages).mean()
                 critic_loss = nn.functional.mse_loss(values, flat_returns)
@@ -598,7 +658,7 @@ if __name__ == "__main__":
     train_overcooked_marl(
         layout_name="cramped_room",
         total_episodes=5,
-        k_steps=400,
+        k_steps=100,
         dry_run=False,
         verbose_trajectory=False,
         horizon=400  # Set horizon to standard 400 steps
